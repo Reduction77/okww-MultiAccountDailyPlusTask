@@ -5,16 +5,22 @@
 本文件放在 ok_tasks/ 目录下即可被 ok-ww 自动加载，不修改任何官方源码，
 上游更新（git pull / 覆盖安装）后无需重做。
 
+要求：ok-ww 版本不早于 2026-05（v3.5+，即官方「多账号每日任务」重构后的版本）。
+
 用法：在任务配置的「Per-Account Tacet 每账号无音区」里每行添加一条：
     打码账号=无音区编号
 例如：159****19oo=3
 账号名以登录界面显示的打码账号为准（含 4 个星号）；
 0/o、大小写、.con/.com 差异会自动容错。
 未配置的账号仍使用「每日任务」里的全局设置；整个列表留空时与官方多账号任务行为一致。
+
+注意：编号覆盖只在「每日任务」的「Which to Farm」设为 Tacet Suppression（无音区）
+时才会生效；若每日任务设的是凝素领域/模拟领域，覆盖值会被忽略。
 """
 
 from src.task.BaseWWTask import LOGIN_TEXTS
 from src.task.DailyTask import DailyTask
+from src.task.MouseResetTask import MouseResetTask
 from src.task.MultiAccountDailyTask import MultiAccountDailyTask, normalize_account_name
 from src.task.TacetTask import TacetTask
 from src.task.WWOneTimeTask import WWOneTimeTask
@@ -34,8 +40,10 @@ class MultiAccountDailyPlusTask(MultiAccountDailyTask):
         self.default_config[PER_ACCOUNT_TACET] = []
         self.config_description[PER_ACCOUNT_TACET] = (
             '可选。每行一条：打码账号=无音区编号，例如 159****19oo=3。'
-            '匹配到的账号会覆盖「每日任务」的「刷第几个无音区」设置；未配置的账号仍用每日任务的设置。 '
-            'Optional: masked_account=tacet_number, one per line, e.g. 159****19oo=3.'
+            '匹配到的账号会覆盖「每日任务」的「刷第几个无音区」设置；未配置的账号仍用每日任务的设置。'
+            '注意：仅当每日任务的「Which to Farm」设为 Tacet Suppression（无音区）时覆盖才生效。 '
+            'Optional: masked_account=tacet_number, one per line, e.g. 159****19oo=3. '
+            'Only takes effect when Daily Task farms Tacet Suppression.'
         )
 
     def run(self):
@@ -116,8 +124,16 @@ class MultiAccountDailyPlusTask(MultiAccountDailyTask):
         if index is None:
             self.run_task_by_class(DailyTask)
             return
-        self.log_info('Account {} farms Tacet Suppression #{} 该账号刷第 {} 个无音区'.format(account, index, index))
         daily_task = self.get_task_by_class(DailyTask)
+        if TACET_INDEX_KEY not in daily_task.config:
+            self.log_warning(
+                '每日任务中找不到配置键「{}」，无音区编号覆盖未生效，可能是 ok-ww 更新后配置键改名，'
+                '请检查脚本适配；本次将使用每日任务的全局设置。'
+                "Tacet override key '{}' not found in Daily Task config, falling back to global setting.".format(
+                    TACET_INDEX_KEY, TACET_INDEX_KEY))
+            self.run_task_by_class(DailyTask)
+            return
+        self.log_info('Account {} farms Tacet Suppression #{} 该账号刷第 {} 个无音区'.format(account, index, index))
         old_value = daily_task.config.get(TACET_INDEX_KEY)
         # 只做内存级覆盖，绕过 Config.__setitem__，不写入每日任务的持久化配置
         dict.__setitem__(daily_task.config, TACET_INDEX_KEY, index)
@@ -127,14 +143,23 @@ class MultiAccountDailyPlusTask(MultiAccountDailyTask):
             dict.__setitem__(daily_task.config, TACET_INDEX_KEY, old_value)
 
     def _click_login_button(self):
-        self.sleep(4)
-        texts = self.ocr()
-        login_btn = self.find_boxes(texts, boundary=self.box_of_screen(0.3, 0.3, 0.7, 0.8),
-                                    match=LOGIN_TEXTS)
-        if login_btn:
-            self.click(login_btn, after_sleep=3)
-        else:
-            self.click_relative(0.5, 0.568, hcenter=True, vcenter=True, after_sleep=3)
-        self.logged_in = False
-        self.ensure_main(time_out=180)
-        self.log_info(self.tr('Login successful'))
+        # 与上游 _select_and_login_account 一致：登录点击期间临时禁用鼠标重置任务，避免干扰
+        mouse_reset_task = self.executor.get_task_by_class(MouseResetTask)
+        mouse_reset_was_enabled = mouse_reset_task.enabled if mouse_reset_task else False
+        if mouse_reset_was_enabled:
+            mouse_reset_task.disable()
+        try:
+            self.sleep(4)
+            texts = self.ocr()
+            login_btn = self.find_boxes(texts, boundary=self.box_of_screen(0.3, 0.3, 0.7, 0.8),
+                                        match=LOGIN_TEXTS)
+            if login_btn:
+                self.click(login_btn, after_sleep=3)
+            else:
+                self.click_relative(0.5, 0.568, hcenter=True, vcenter=True, after_sleep=3)
+            self.logged_in = False
+            self.ensure_main(time_out=180)
+            self.log_info(self.tr('Login successful'))
+        finally:
+            if mouse_reset_was_enabled:
+                mouse_reset_task.enable()
