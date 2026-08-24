@@ -25,13 +25,19 @@ v1.1 稳定性修复：
 - 「返回登录界面」重写为带状态校验的重试流程：esc 未生效会自动重发，
   确认弹窗改为真实等待（上游 click_confirm 写死 1 秒，弹窗动画稍慢就会漏点），
   单次输入丢失不再导致卡死或异常退出；
-- 运行期间临时暂停「自动登录」触发任务（仅内存、不写配置，结束后自动恢复），
-  消除登录阶段它与任务自身的登录等待并发点击「进入游戏」造成的窗口闪烁；
 - 第二阶段切号失败会自动恢复到登录界面重试，连续失败 3 次才中止任务。
+
+v1.2 修复登录时画面一直闪：
+- 根因：ok-script 执行器是单线程的，一次性任务运行期间触发任务（自动登录）
+  根本不会被调度，登录点击全部来自本任务 ensure_main -> wait_login 的逐帧轮询，
+  读条期间「进入游戏」被每秒连点、动画反复重启，画面就一直闪。
+- 修复：给 wait_login 加 5 秒防抖（与官方自动登录同节奏），防抖窗口内只做
+  状态检测不点击，窗口外才执行官方完整登录逻辑——等效于"让官方来点"。
 """
 
+import time
+
 from ok import CannotFindException, TaskDisabledException
-from src.task.AutoLoginTask import AutoLoginTask
 from src.task.BaseWWTask import LOGIN_TEXTS
 from src.task.DailyTask import DailyTask
 from src.task.MouseResetTask import MouseResetTask
@@ -43,6 +49,7 @@ from src.task.WWOneTimeTask import WWOneTimeTask
 PER_ACCOUNT_TACET = 'Per-Account Tacet 每账号无音区'
 TACET_INDEX_KEY = 'Which Tacet Suppression to Farm'  # 必须与 DailyTask 的配置键保持一致
 CONFIRM_BUTTONS = ['confirm_btn_hcenter_vcenter', 'confirm_btn_highlight_hcenter_vcenter']
+LOGIN_CLICK_DEBOUNCE = 5  # 登录点击防抖秒数，与官方 AutoLoginTask 的触发间隔一致
 
 
 class MultiAccountDailyPlusTask(MultiAccountDailyTask):
@@ -63,7 +70,7 @@ class MultiAccountDailyPlusTask(MultiAccountDailyTask):
             'Configured accounts run first in input order. '
             'Only takes effect when Daily Task farms Tacet Suppression.'
         )
-        self._auto_login_task = None
+        self._login_click_debounce = 0
 
     def run(self):
         WWOneTimeTask.run(self)
@@ -71,57 +78,53 @@ class MultiAccountDailyPlusTask(MultiAccountDailyTask):
         self.all_accounts.clear()
         # dict 保序（Python 3.7+），键的遍历顺序即配置里的输入顺序
         overrides = self._parse_account_tacet_overrides()
-        self._suspend_auto_login()
-        try:
-            if overrides:
-                # 第一阶段：配置了自选无音区的账号，严格按输入顺序执行
-                self._switch_to_login_safely()
-                for target in overrides:
-                    account = self._select_specific_and_login_account(target)
-                    if account is None:
-                        # 下拉列表里找不到该账号（打码名填错或账号已被移除），跳过
-                        continue
-                    self.info_set('Completed', self.done_set)
-                    self._run_daily_for_account(account, overrides)
-                    self._mark_done(account)
-                    self._switch_to_login_safely()
-                self.info_set('Completed', self.done_set)
-            else:
-                # 无配置时与官方多账号任务一致：先跑当前已登录的账号
-                self.run_task_by_class(DailyTask)
-                self._switch_to_login_safely()
-                self._mark_done(self._detect_current_account_from_login())
-                self.info_set('Completed', self.done_set)
-
-            # 第二阶段：剩余未配置的账号，按登录下拉列表顺序执行（官方逻辑 + 失败自愈）
-            consecutive_failures = 0
-            while True:
-                try:
-                    next_account = self._select_and_login_account()
-                except CannotFindException:
-                    # 所有账号均已完成（官方多账号任务此处直接抛出，这里接住并正常结束）
-                    self.log_info(self.tr('All accounts completed'))
-                    break
-                except TaskDisabledException:
-                    raise
-                except Exception as e:
-                    # 切号流程失败（输入丢失、弹窗干扰等）：恢复到登录界面后重试
-                    consecutive_failures += 1
-                    self.log_error('Switch account failed 切号失败 ({}/3)'.format(consecutive_failures), e)
-                    self.screenshot('MultiAccountDailyPlusTask_switch')
-                    if consecutive_failures >= 3:
-                        raise
-                    self._recover_to_login()
+        if overrides:
+            # 第一阶段：配置了自选无音区的账号，严格按输入顺序执行
+            self._switch_to_login_safely()
+            for target in overrides:
+                account = self._select_specific_and_login_account(target)
+                if account is None:
+                    # 下拉列表里找不到该账号（打码名填错或账号已被移除），跳过
                     continue
-                if not next_account:
-                    break
-                consecutive_failures = 0
                 self.info_set('Completed', self.done_set)
-                self._run_daily_for_account(next_account, overrides)
-                self._mark_done(next_account)
+                self._run_daily_for_account(account, overrides)
+                self._mark_done(account)
                 self._switch_to_login_safely()
-        finally:
-            self._restore_auto_login()
+            self.info_set('Completed', self.done_set)
+        else:
+            # 无配置时与官方多账号任务一致：先跑当前已登录的账号
+            self.run_task_by_class(DailyTask)
+            self._switch_to_login_safely()
+            self._mark_done(self._detect_current_account_from_login())
+            self.info_set('Completed', self.done_set)
+
+        # 第二阶段：剩余未配置的账号，按登录下拉列表顺序执行（官方逻辑 + 失败自愈）
+        consecutive_failures = 0
+        while True:
+            try:
+                next_account = self._select_and_login_account()
+            except CannotFindException:
+                # 所有账号均已完成（官方多账号任务此处直接抛出，这里接住并正常结束）
+                self.log_info(self.tr('All accounts completed'))
+                break
+            except TaskDisabledException:
+                raise
+            except Exception as e:
+                # 切号流程失败（输入丢失、弹窗干扰等）：恢复到登录界面后重试
+                consecutive_failures += 1
+                self.log_error('Switch account failed 切号失败 ({}/3)'.format(consecutive_failures), e)
+                self.screenshot('MultiAccountDailyPlusTask_switch')
+                if consecutive_failures >= 3:
+                    raise
+                self._recover_to_login()
+                continue
+            if not next_account:
+                break
+            consecutive_failures = 0
+            self.info_set('Completed', self.done_set)
+            self._run_daily_for_account(next_account, overrides)
+            self._mark_done(next_account)
+            self._switch_to_login_safely()
 
     def validate_config(self, key, value):
         if key == PER_ACCOUNT_TACET:
@@ -262,28 +265,26 @@ class MultiAccountDailyPlusTask(MultiAccountDailyTask):
                 return account.name
         return None
 
-    # ---------- 以下为稳定性增强（与多账号周常乐园 v1.1 相同） ----------
+    # ---------- 以下为稳定性增强（与多账号周常乐园相同） ----------
 
-    def _suspend_auto_login(self):
-        """运行期间临时暂停「自动登录」触发任务（仅内存、不写配置，finally 中恢复）。
+    def wait_login(self):
+        """登录/读条阶段的点击防抖：让点击按官方「自动登录」的节奏来（5 秒一次）。
 
-        自动登录每 5 秒触发一次 wait_login，而本任务在登录/读条阶段也会通过
-        ensure_main -> wait_login 点击「进入游戏」；两边并发点击会让登录动画
-        反复重启、游戏窗口反复抢焦点，表现为登录时一直闪。
-        故意用 _enabled 直接赋值绕过 disable()：disable() 会把 _enabled=False
-        写进持久化配置，异常退出后用户的自动登录就再也回不来了。
+        背景：ok-script 的执行器是单线程的，一次性任务运行期间触发任务不会被调度，
+        所以登录阶段的点击实际全部来自本任务的 ensure_main -> wait_login 轮询——
+        它每一帧都会执行，读条期间「进入游戏」横幅一直在屏幕上，就会被每秒连点，
+        按钮动画反复重启，表现为画面一直闪；而官方 AutoLoginTask 是 5 秒才触发一次，
+        不会闪。这里给 wait_login 加 5 秒防抖：防抖窗口内只做登录状态检测、不点击，
+        窗口外才执行官方完整逻辑（含点击），效果等同于"让官方来点"。
         """
-        task = self.executor.get_task_by_class(AutoLoginTask)
-        if task is not None and task.enabled:
-            task._enabled = False
-            self._auto_login_task = task
-            self.log_info('Auto Login trigger paused during this run 运行期间已暂停自动登录触发')
-
-    def _restore_auto_login(self):
-        if self._auto_login_task is not None:
-            self._auto_login_task._enabled = True
-            self._auto_login_task = None
-            self.log_info('Auto Login trigger restored 已恢复自动登录触发')
+        now = time.time()
+        if now - self._login_click_debounce < LOGIN_CLICK_DEBOUNCE:
+            if self.in_team_and_world():
+                self.logged_in = True
+                return True
+            return False
+        self._login_click_debounce = now
+        return super().wait_login()
 
     def _switch_to_login_safely(self):
         """返回登录界面（含回到主界面 + 带校验的切换，失败自动重试，最多 3 次）。
