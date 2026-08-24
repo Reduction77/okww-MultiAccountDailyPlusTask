@@ -26,6 +26,14 @@ v1.2 修复登录时画面一直闪：
   读条期间「进入游戏」被每秒连点、动画反复重启，画面就一直闪。
 - 修复：给 wait_login 加 5 秒防抖（与官方自动登录同节奏），防抖窗口内只做
   状态检测不点击，窗口外才执行官方完整登录逻辑——等效于"让官方来点"。
+
+v1.3 修复前台点不上登录：
+- 根因：鸣潮窗口抢到前台后走 RawInput，会无视 PostMessage 后台点击/按键，
+  而游戏在退出登录、进入登录界面等切换时会自己抢前台，于是点击全部失效，
+  表现为「前台点不上登录，手动聚焦别的窗口才能继续」。
+- 修复：检测到游戏在前台时自动把前台焦点让给其他窗口（画面不动，只是失去
+  激活状态），后台点击随即恢复；返回登录界面、选号登录、登录等待、
+  刷本开始时都会检查。
 """
 
 import time
@@ -85,6 +93,12 @@ class MultiAccountGardenTask(MultiAccountDailyTask):
             self._run_garden()
             self._mark_done(next_account)
             self._switch_to_login_safely()
+            pass
+
+    def _select_and_login_account(self):
+        # 游戏抢前台时后台点击会被忽略，先让出焦点再走官方选号流程
+        self._yield_foreground_if_game_front()
+        return super()._select_and_login_account()
 
     def _run_garden(self):
         """为当前已登录的账号运行周常乐园。
@@ -94,6 +108,7 @@ class MultiAccountGardenTask(MultiAccountDailyTask):
         失败处理参照上游 DailyTask.check_weekly_garden：截图、恢复主界面，
         让外层流程继续下一个账号；用户手动停止（TaskDisabledException）必须继续抛出。
         """
+        self._yield_foreground_if_game_front()
         try:
             self.run_task_by_class(GardenTask)
         except TaskDisabledException:
@@ -115,6 +130,7 @@ class MultiAccountGardenTask(MultiAccountDailyTask):
         不会闪。这里给 wait_login 加 5 秒防抖：防抖窗口内只做登录状态检测、不点击，
         窗口外才执行官方完整逻辑（含点击），效果等同于"让官方来点"。
         """
+        self._yield_foreground_if_game_front()
         now = time.time()
         if now - self._login_click_debounce < LOGIN_CLICK_DEBOUNCE:
             if self.in_team_and_world():
@@ -123,6 +139,98 @@ class MultiAccountGardenTask(MultiAccountDailyTask):
             return False
         self._login_click_debounce = now
         return super().wait_login()
+
+    def _yield_foreground_if_game_front(self):
+        """游戏抢到前台时，PostMessage 后台点击/按键会被游戏忽略（前台走 RawInput），
+        表现为「登录点不上、要手动聚焦别的窗口才能继续」。检测到游戏在前台时，
+        自动把前台焦点让给其他窗口——游戏画面保持不动，只是失去激活状态，
+        后台点击随即恢复生效。游戏不在前台时本方法什么都不做。"""
+        hwnd_window = self.hwnd
+        if hwnd_window is None or not getattr(hwnd_window, 'hwnd', 0):
+            return
+        try:
+            if not hwnd_window.is_foreground():
+                return
+        except Exception:
+            return
+        try:
+            import win32gui
+        except ImportError:
+            return
+        candidates = []
+        try:
+            shell_hwnd = win32gui.GetShellWindow()
+            if shell_hwnd:
+                candidates.append(shell_hwnd)
+        except Exception:
+            pass
+        ok_main = self._get_ok_main_hwnd()
+        if ok_main:
+            candidates.append(ok_main)
+        game_hwnds = {hwnd_window.hwnd}
+        try:
+            game_hwnds.update(w[0] for w in (hwnd_window.hwnds or []))
+        except Exception:
+            pass
+        for target in candidates:
+            if not target or target in game_hwnds:
+                continue
+            try:
+                if self._force_foreground(target, game_hwnds):
+                    self.log_info(
+                        'Game grabbed foreground, yielded focus 游戏抢到前台，已让出焦点以恢复后台点击')
+                    return
+            except Exception as e:
+                self.log_warning('Yield foreground failed 让出前台焦点失败: {}'.format(e))
+
+    def _force_foreground(self, target, game_hwnds):
+        """把前台焦点设给 target 窗口，返回游戏是否已不再处于前台。
+
+        用 AttachThreadInput 把本线程挂到当前前台线程上，绕过 Windows 前台锁；
+        失败则用 alt 键技巧临时解除前台锁再试一次。
+        """
+        import win32api
+        import win32con
+        import win32gui
+        import win32process
+        fg = win32gui.GetForegroundWindow()
+        if not fg or fg == target:
+            return True
+        fg_thread, _ = win32process.GetWindowThreadProcessId(fg)
+        cur_thread = win32api.GetCurrentThreadId()
+        attached = False
+        try:
+            if fg_thread and fg_thread != cur_thread:
+                attached = bool(win32process.AttachThreadInput(cur_thread, fg_thread, True))
+            win32gui.BringWindowToTop(target)
+            win32gui.SetForegroundWindow(target)
+        finally:
+            if attached:
+                try:
+                    win32process.AttachThreadInput(cur_thread, fg_thread, False)
+                except Exception:
+                    pass
+        if win32gui.GetForegroundWindow() not in game_hwnds:
+            return True
+        # 兜底：alt 键技巧临时解除前台锁再试一次
+        try:
+            win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+            win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32gui.SetForegroundWindow(target)
+        except Exception:
+            pass
+        return win32gui.GetForegroundWindow() not in game_hwnds
+
+    def _get_ok_main_hwnd(self):
+        """取 ok-ww 主窗口句柄，作为让出前台焦点时的备选目标。"""
+        try:
+            from ok import og
+            main_window = getattr(og, 'main_window', None)
+            if main_window is not None:
+                return int(main_window.winId())
+        except Exception:
+            pass
+        return 0
 
     def _switch_to_login_safely(self):
         """返回登录界面（含回到主界面 + 带校验的切换，失败自动重试，最多 3 次）。
@@ -150,6 +258,7 @@ class MultiAccountGardenTask(MultiAccountDailyTask):
     def _do_switch_to_login(self):
         """执行一次「主界面 -> 登录界面」切换，每一步都校验结果，失败即抛异常交给上层重试。"""
         self.log_info(self.tr('Switching back to login screen'))
+        self._yield_foreground_if_game_front()
         # 1. 打开终端菜单：esc 未生效就重发，最多 3 次；期间若发现已在登录界面则直接完成
         menu_open = False
         for _ in range(3):
