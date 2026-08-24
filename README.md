@@ -1,8 +1,9 @@
-# okww-MultiAccountDailyPlusTask
+# okww 自定义任务集
 
-适用于 [ok-wuthering-waves](https://github.com/ok-oldking/ok-wuthering-waves)（ok-ww）的自定义任务：**多账号每日+**。
+适用于 [ok-wuthering-waves](https://github.com/ok-oldking/ok-wuthering-waves)（ok-ww）的自定义任务：
 
-在官方「多账号每日任务」的基础上，支持**每个账号自选刷第几个无音区**。
+1. **多账号每日+**：在官方「多账号每日任务」基础上，支持每个账号自选刷第几个无音区
+2. **多账号周常乐园**：自动切换所有账号刷满周常乐园
 
 ## 环境要求
 
@@ -11,9 +12,15 @@
 
 ## 安装
 
-把 `MultiAccountDailyPlusTask.py` 放进 ok-ww 安装目录下的 `ok_tasks/` 文件夹，重启 ok-ww 后任务列表里会出现 **「👥 Multi Account Daily+ 多账号每日+」**。
+把需要的 `.py` 文件放进 ok-ww 安装目录下的 `ok_tasks/` 文件夹，重启 ok-ww 即可在任务列表中看到。
 
-## 使用方法
+---
+
+## 任务一：👥 Multi Account Daily+ 多账号每日+
+
+文件：`MultiAccountDailyPlusTask.py`
+
+### 使用方法
 
 1. 在「每日任务」里确认 **Which to Farm 设为 Tacet Suppression（无音区）**——编号覆盖只有在这种情况下才生效；设成凝素领域/模拟领域时覆盖会被忽略。
 2. 在本任务的配置项 **「Per-Account Tacet 每账号无音区」** 里，每行添加一条：
@@ -34,8 +41,25 @@
 
 无音区编号从 1 开始，对应 F2 指南书里的顺序，上限自动跟随 ok-ww 的 TacetTask（当前共 19 个）。
 
-## 实现说明
+### 实现说明
 
 - 只做内存级覆盖（`dict.__setitem__`），不会改动「每日任务」的持久化配置
 - 编号上限动态读取 `TacetTask.total_number`，游戏新增无音区后无需改脚本
 - 若 ok-ww 更新后每日任务的配置键改名，脚本会输出警告并回退到全局设置，不会静默刷错本
+
+---
+
+## 任务二：🎡 Multi Account Garden 多账号周常乐园
+
+文件：`MultiAccountGardenTask.py`
+
+### 使用方法
+
+无需任何配置。从当前已登录的账号开始，依次切换登录界面下拉列表里的所有账号，逐个运行官方「自动周常乐园」。
+
+### 实现说明
+
+- **不需要识别账号**：官方 `GardenTask` 自带完成检测（OCR 是否已达 6000 积分上限），刷过的账号会自动跳过，所以直接让每个账号都跑一遍即可
+- 账号切换机制直接继承官方 `MultiAccountDailyTask`，与官方多账号任务行为一致
+- 单个账号失败时截图并恢复主界面，继续下一个账号，不中断整体流程
+- 所有账号完成后正常结束（官方多账号任务此处会以异常收尾，本任务做了捕获处理）
